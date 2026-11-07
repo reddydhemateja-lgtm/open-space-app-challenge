@@ -1,5 +1,7 @@
 from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, UploadFile, File, Query, HTTPException
+import os
+import urllib.request
+from fastapi import APIRouter, UploadFile, File, Query, HTTPException, Body
 
 from ..models.schemas import (
     HarmonizedDetection,
@@ -38,7 +40,7 @@ class DatasetState:
             self.metadata.date_range_start = dates[0]
             self.metadata.date_range_end = dates[-1]
 
-    def set_dataset(self, raw_dets: List[HarmonizedDetection], filename: str, is_demo: bool = False):
+    def set_dataset(self, raw_dets: List[HarmonizedDetection], filename: str, is_demo: bool = False, custom_title: Optional[str] = None):
         self.clusters, self.detections = cluster_detections(raw_dets)
         dates = sorted(list(set(d.acq_date for d in self.detections))) if self.detections else []
         sensors = sorted(list(set(d.sensor for d in self.detections))) if self.detections else []
@@ -51,8 +53,10 @@ class DatasetState:
             "max_lon": max((d.longitude for d in self.detections), default=0.0),
         }
 
+        dataset_title = custom_title or f"User Dataset: {filename}"
+
         self.metadata = DatasetMetadata(
-            dataset_name=f"User Dataset: {filename}",
+            dataset_name=dataset_title,
             is_demonstration_data=is_demo,
             total_raw_detections=len(self.detections),
             total_harmonized_clusters=len(self.clusters),
@@ -62,7 +66,7 @@ class DatasetState:
             sensors_present=sensors,
             satellites_present=sats,
             disclaimer=(
-                "USER UPLOADED OBSERVATION DATA: Satellite observations denote thermal anomalies. "
+                "REAL NASA FIRMS OBSERVATION DATA: Satellite observations denote thermal anomalies. "
                 "Confidence values and cluster perimeters represent statistical estimations. "
                 "Never use for life safety or real-time predictive fire perimeters."
             )
@@ -70,6 +74,115 @@ class DatasetState:
 
 # Global singleton state
 state = DatasetState()
+
+@router.get("/presets")
+def get_presets():
+    """List available real NASA datasets and demo benchmarks."""
+    return [
+        {
+            "id": "demo_california",
+            "name": "Demonstration Benchmark: California Fire Season",
+            "type": "demonstration",
+            "description": "Multi-month benchmark with synthetic thermal dynamics and simulated overpasses."
+        },
+        {
+            "id": "nasa_dixie",
+            "name": "Real NASA FIRMS: Northern California Dixie Fire (August 2021)",
+            "type": "real_nasa",
+            "description": "Actual NASA FIRMS observations covering the historic peak of the Dixie Fire with coincident MODIS (Aqua/Terra) and VIIRS (S-NPP/NOAA-20)."
+        },
+        {
+            "id": "nasa_canada",
+            "name": "Real NASA FIRMS: Canadian Boreal Wildfire Outbreak (June 2023)",
+            "type": "real_nasa",
+            "description": "Actual NASA FIRMS observations of the extreme Canadian boreal forest fires across Quebec and Ontario."
+        }
+    ]
+
+@router.post("/load-preset/{preset_id}")
+def load_preset(preset_id: str):
+    """Load an authentic real NASA FIRMS dataset or reset to demo."""
+    if preset_id == "demo_california":
+        state.reset_to_demo()
+        return {"success": True, "message": "Loaded California demo benchmark", "metadata": state.metadata}
+
+    base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    file_map = {
+        "nasa_dixie": ("real_nasa_california_dixie.csv", "Real NASA FIRMS: Northern California Dixie Fire (August 2021)"),
+        "nasa_canada": ("real_nasa_canada_boreal.csv", "Real NASA FIRMS: Canadian Boreal Wildfire Outbreak (June 2023)")
+    }
+
+    if preset_id not in file_map:
+        raise HTTPException(status_code=404, detail="Preset dataset not found.")
+
+    fname, title = file_map[preset_id]
+    csv_path = os.path.join(base_dir, "data", fname)
+
+    if not os.path.exists(csv_path):
+        raise HTTPException(status_code=404, detail=f"Dataset file {fname} not found on server.")
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    parsed_dets, warnings = parse_firms_csv(content, filename=fname)
+    state.set_dataset(parsed_dets, filename=fname, is_demo=False, custom_title=title)
+
+    return {
+        "success": True,
+        "message": f"Successfully loaded real NASA FIRMS dataset: {title}",
+        "records_count": len(parsed_dets),
+        "clusters_count": len(state.clusters),
+        "warnings": warnings,
+        "metadata": state.metadata
+    }
+
+@router.post("/fetch-firms-api")
+def fetch_from_nasa_firms_api(
+    map_key: str = Body(..., embed=True),
+    country_code: str = Body("USA", embed=True),
+    day_range: int = Body(1, embed=True)
+):
+    """
+    Query the official live NASA FIRMS API using user's MAP_KEY.
+    Fetches real-time observations from MODIS (Terra/Aqua) and VIIRS (S-NPP/NOAA-20/NOAA-21).
+    """
+    clean_key = map_key.strip()
+    if not clean_key or len(clean_key) < 16:
+        raise HTTPException(status_code=400, detail="Invalid NASA FIRMS MAP_KEY. Keys are 32-character strings obtained free from firms.modaps.eosdis.nasa.gov.")
+
+    # Fetch MODIS NRT and VIIRS SNPP NRT
+    all_dets = []
+    warnings = []
+
+    sources = ["MODIS_NRT", "VIIRS_SNPP_NRT"]
+    for src in sources:
+        url = f"https://firms.modaps.eosdis.nasa.gov/api/country/csv/{clean_key}/{src}/{country_code}/{day_range}"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "NASA-SpaceApps-Harmonizer/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as response:
+                csv_text = response.read().decode("utf-8")
+                if "Invalid Map Key" in csv_text or "Transaction Limit" in csv_text:
+                    raise HTTPException(status_code=400, detail=f"NASA FIRMS API error: {csv_text[:120]}")
+                dets, warns = parse_firms_csv(csv_text, filename=f"NASA_FIRMS_{src}.csv")
+                all_dets.extend(dets)
+                warnings.extend(warns)
+        except Exception as e:
+            warnings.append(f"Failed to fetch {src}: {str(e)}")
+
+    if not all_dets:
+        raise HTTPException(status_code=400, detail="No active thermal records returned by NASA FIRMS API for this area/date range.")
+
+    title = f"Live NASA FIRMS API Feed: {country_code} ({len(all_dets)} detections)"
+    state.set_dataset(all_dets, filename=f"live_{country_code}.csv", is_demo=False, custom_title=title)
+
+    return {
+        "success": True,
+        "message": f"Successfully ingested live NASA satellite observations from space!",
+        "records_count": len(all_dets),
+        "clusters_count": len(state.clusters),
+        "warnings": warnings,
+        "metadata": state.metadata
+    }
 
 @router.get("/metadata", response_model=DatasetMetadata)
 def get_metadata():
