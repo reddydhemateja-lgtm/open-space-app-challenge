@@ -120,7 +120,8 @@ export interface AnomalySummary {
   scientific_disclaimer: string;
 }
 
-const API_BASE = '/api';
+const RAW_BASE = import.meta.env.VITE_API_URL || '';
+const API_BASE = RAW_BASE ? (RAW_BASE.endsWith('/') ? `${RAW_BASE.slice(0, -1)}/api` : `${RAW_BASE}/api`) : '/api';
 
 export async function fetchHealth(): Promise<any> {
   const res = await fetch(`${API_BASE}/health`);
